@@ -482,8 +482,6 @@ class LLMEngine:
         #     question = str(_prefix) + ":" + question
         #     if not question:
         #         continue
-        #     print("kk")
-        #     print(question)
         #     # Create a new Sequence for the question
         #     block_size = self.cache_config.block_size
         #     seq_id = next(self.seq_counter)
@@ -863,7 +861,6 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
         if not scheduler_outputs.is_empty():
-            # Execute the model.
             all_outputs = self._run_workers(
                 "execute_model",
                 driver_kwargs={

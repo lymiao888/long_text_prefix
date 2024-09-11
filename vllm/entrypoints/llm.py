@@ -165,7 +165,7 @@ class LLM:
         """
         if prefix_pos == None:
             prefix_pos = self.generate_prefix_pos(prompts)
-        print(prefix_pos)
+
         if prompts is None and prompt_token_ids is None:
             raise ValueError("Either prompts or prompt_token_ids must be "
                              "provided.")

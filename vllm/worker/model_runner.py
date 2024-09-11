@@ -117,10 +117,37 @@ class ModelRunner:
                           1) // block_size
         self.graph_block_tables = np.zeros(
             (max(_BATCH_SIZES_TO_CAPTURE), max_num_blocks), dtype=np.int32)
+        
+    def cache_swap(
+        self,
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> None:
+        # Issue cache operations.
+        issued_cache_op = False
+        if blocks_to_swap_in:
+            self.cache_engine.swap_in(blocks_to_swap_in)
+            issued_cache_op = True
+        if blocks_to_swap_out:
+            self.cache_engine.swap_out(blocks_to_swap_out)
+            issued_cache_op = True
+        if blocks_to_copy:
+            self.cache_engine.copy(blocks_to_copy)
+            issued_cache_op = True
+
+        cache_events = self.cache_events if issued_cache_op else None
+
+        # Wait for cache operations to finish.
+        # TODO(woosuk): Profile swapping overhead and optimize if needed.
+        if cache_events is not None:
+            for event in cache_events:
+                event.wait()
 
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        question_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
                List[int], List[int], Set[LoRARequest]]:
         assert len(seq_group_metadata_list) > 0
@@ -141,7 +168,7 @@ class ModelRunner:
             assert len(seq_ids) == 1
             seq_id = seq_ids[0]
 
-            seq_data = seq_group_metadata.seq_data[seq_id]
+            seq_data = seq_group_metadata.seq_data[seq_id][question_id]
             prompt_tokens = seq_data.get_token_ids()
             prompt_len = len(prompt_tokens)
             prompt_lens.append(prompt_len)
@@ -477,6 +504,7 @@ class ModelRunner:
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        question_id: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata,
                Set[int], LoRAMapping]:
         if self.is_driver_worker:
@@ -487,11 +515,11 @@ class ModelRunner:
             if is_prompt:
                 (input_tokens, input_positions, input_metadata, prompt_lens,
                  subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_prompt(seq_group_metadata_list)
+                 lora_requests) = self._prepare_prompt(seq_group_metadata_list, question_id)
             else:
                 (input_tokens, input_positions, input_metadata,
                  lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_decode(seq_group_metadata_list)
+                 lora_requests) = self._prepare_decode(seq_group_metadata_list, question_id)
                 prompt_lens = []
                 subquery_lens = None
             sampling_metadata = self._prepare_sample(seq_group_metadata_list,
@@ -564,33 +592,38 @@ class ModelRunner:
     def execute_model(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+        question_nums:int,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Optional[SamplerOutput]:
-        (input_tokens, input_positions, input_metadata, sampling_metadata,
-         lora_requests,
-         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+    ) -> Optional[Union[SamplerOutput, List[SamplerOutput]]]:
+        outputs=[]
+        for i in range(question_nums):
+            (input_tokens, input_positions, input_metadata, sampling_metadata,
+            lora_requests,
+            lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list, i)
 
-        if self.lora_config:
-            self.set_active_loras(lora_requests, lora_mapping)
+            if self.lora_config:
+                self.set_active_loras(lora_requests, lora_mapping)
 
-        # Execute the model.
-        if input_metadata.use_cuda_graph:
-            graph_batch_size = input_tokens.shape[0]
-            model_executable = self.graph_runners[graph_batch_size]
-        else:
-            model_executable = self.model
-        hidden_states = model_executable(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=kv_caches,
-            input_metadata=input_metadata,
-        )
-        # Sample the next token.
-        output = self.model.sample(
-            hidden_states=hidden_states,
-            sampling_metadata=sampling_metadata,
-        )
-        return output
+            # Execute the model.
+            if input_metadata.use_cuda_graph:
+                graph_batch_size = input_tokens.shape[0]
+                model_executable = self.graph_runners[graph_batch_size]
+            else:
+                model_executable = self.model
+            hidden_states = model_executable(
+                input_ids=input_tokens,
+                positions=input_positions,
+                kv_caches=kv_caches,
+                input_metadata=input_metadata,
+            )
+            # Sample the next token.
+            output = self.model.sample(
+                hidden_states=hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+            outputs.append(output)
+            # self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
+        return outputs
 
     @torch.inference_mode()
     def profile_run(self) -> None:
